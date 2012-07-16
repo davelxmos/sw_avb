@@ -71,7 +71,7 @@ typedef struct clock_info_t {
 } clock_info_t;
 
 /// The array of media clock state structures
-static clock_info_t clock_states[MAX_NUM_MEDIA_CLOCKS];
+static clock_info_t clock_states[AVB_NUM_MEDIA_CLOCKS];
 
 /**
  * \brief Converts the internal 64 bit wordlen into an external 32 bit wordlen

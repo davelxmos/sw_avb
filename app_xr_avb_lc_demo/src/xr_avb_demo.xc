@@ -3,10 +3,10 @@
 #include <xccompat.h>
 #include <stdio.h>
 #include <string.h>
+#include <xscope.h>
 #include "xtcp_client.h"
 #include "uip_server.h"
 #include "audio_i2s.h"
-#include "xlog_server.h"
 #include "i2c.h"
 #include "avb.h"
 #include "audio_clock_CS2300CP.h"
@@ -71,7 +71,7 @@ on stdcore[1]: smi_interface_t smi = { PORT_ETH_MDIO, PORT_ETH_MDC, 0 };
 on stdcore[1]: struct r_i2c r_i2c = { PORT_I2C_SCL, PORT_I2C_SDA };
 
 //***** AVB audio ports ****
-on stdcore[0]: out port p_fs = PORT_SYNC_OUT;
+on stdcore[0]: out port p_fs[AVB_NUM_MEDIA_CLOCKS] = {PORT_SYNC_OUT};
 on stdcore[0]: clock b_mclk = XS1_CLKBLK_1;
 on stdcore[0]: clock b_bclk = XS1_CLKBLK_2;
 on stdcore[0]: in port p_aud_mclk = PORT_MCLK;
@@ -100,7 +100,10 @@ media_output_fifo_data_t ofifo_data[AVB_NUM_MEDIA_OUTPUTS];
 media_output_fifo_t ofifos[AVB_NUM_MEDIA_OUTPUTS];
 
 
-
+void xscope_user_init(void) {
+  xscope_register(0);
+  xscope_config_io(XSCOPE_IO_BASIC);
+}
 
 int main(void) {
 	// ethernet tx channels
@@ -118,7 +121,6 @@ int main(void) {
 
 	// media control
 	chan media_ctl[AVB_NUM_MEDIA_UNITS];
-	chan clk_ctl[AVB_NUM_MEDIA_CLOCKS];
 	chan media_clock_ctl;
 
 	// audio channels
@@ -173,14 +175,13 @@ int main(void) {
 					c_gpio_ctl);
 		}
 
-		on stdcore[1]:
+		on stdcore[0]:
 		{
 			media_clock_server(media_clock_ctl,
-					ptp_link[1],
-					buf_ctl,
-					AVB_NUM_LISTENER_UNITS,
-					clk_ctl,
-					AVB_NUM_MEDIA_CLOCKS);
+                                           ptp_link[1],
+                                           buf_ctl,
+                                           AVB_NUM_LISTENER_UNITS,
+                                           p_fs);
 		}
 
 		// AVB - Audio
@@ -188,24 +189,19 @@ int main(void) {
 			init_media_input_fifos(ififos, ififo_data, AVB_NUM_MEDIA_INPUTS);
 			configure_clock_src(b_mclk, p_aud_mclk);
 			start_clock(b_mclk);
-			par
-			{
-				audio_gen_CS2300CP_clock(p_fs, clk_ctl[0]);
-
-				i2s_master (b_mclk,
-						b_bclk,
-						p_aud_bclk,
-						p_aud_lrclk,
-						p_aud_dout,
-						AVB_NUM_MEDIA_OUTPUTS,
-						p_aud_din,
-						AVB_NUM_MEDIA_INPUTS,
-						MASTER_TO_WORDCLOCK_RATIO,
-						c_samples_to_codec,
-						ififos,
-						media_ctl[0],
-						0);
-			}
+                        i2s_master (b_mclk,
+                                    b_bclk,
+                                    p_aud_bclk,
+                                    p_aud_lrclk,
+                                    p_aud_dout,
+                                    AVB_NUM_MEDIA_OUTPUTS,
+                                    p_aud_din,
+                                    AVB_NUM_MEDIA_INPUTS,
+                                    MASTER_TO_WORDCLOCK_RATIO,
+                                    c_samples_to_codec,
+                                    ififos,
+                                    media_ctl[0],
+                                    0);
 		}
 
 		// AVB Talker - must be on the same core as the audio interface
@@ -230,11 +226,6 @@ int main(void) {
 					AVB_NUM_MEDIA_OUTPUTS);
 		}
 
-		// Xlog server
-		on stdcore[0]:
-		{
-			xlog_server_uart(p_uart_tx);
-		}
 
 		// Application threads
 		on stdcore[0]:

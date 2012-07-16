@@ -21,16 +21,7 @@
 #define MIN_FILL_LEVEL 5
 #define MAX_SAMPLES_PER_1722_PACKET 12
 
-static media_clock_t media_clocks[MAX_NUM_MEDIA_CLOCKS];
-
-void clk_ctl_set_rate(chanend clk_ctl, int wordLength)
-{
-  master
-  {
-    clk_ctl <: CLK_CTL_SET_RATE;
-    clk_ctl <: wordLength;
-  }
-}
+static media_clock_t media_clocks[AVB_NUM_MEDIA_CLOCKS];
 
 typedef struct buf_info_t {
   int lock_count;
@@ -50,7 +41,7 @@ void update_stream_derived_clocks(int source_num,
                                   int locked,
                                   int fill)
 {
-  for (int i=0;i<MAX_NUM_MEDIA_CLOCKS;i++) {
+  for (int i=0;i<AVB_NUM_MEDIA_CLOCKS;i++) {
     if (media_clocks[i].active &&
         (media_clocks[i].clock_type == MEDIA_FIFO_DERIVED ||
          media_clocks[i].clock_type == FIFO_LENGTH)&&
@@ -70,7 +61,7 @@ void update_stream_derived_clocks(int source_num,
 
 void inform_media_clocks_of_lock(int source_num) 
 {
- for (int i=0;i<MAX_NUM_MEDIA_CLOCKS;i++) {
+ for (int i=0;i<AVB_NUM_MEDIA_CLOCKS;i++) {
     if (media_clocks[i].active &&
         media_clocks[i].clock_type == MEDIA_FIFO_DERIVED &&
         media_clocks[i].source == source_num) 
@@ -102,11 +93,12 @@ int get_buf_info(int fifo)
   return stream_num;
 }
 
-
+#pragma unsafe arrays
 static void manage_buffer(buf_info_t &b,
-                          chanend ptp_svr, 
+                          chanend ?ptp_svr,
                           chanend buf_ctl,
-                          int index) 
+                          int index,
+                          timer tmr)
 {
   unsigned outgoing_timestamp_local;
   unsigned presentation_timestamp;
@@ -116,7 +108,6 @@ static void manage_buffer(buf_info_t &b,
   int diff, sample_diff;
   unsigned int wordLength;
   int rdptr,wrptr,fill;
-  timer tmr;
   int thiscore_now,othercore_now;
   unsigned server_core_id;
 
@@ -154,9 +145,8 @@ static void manage_buffer(buf_info_t &b,
     fill += MEDIA_OUTPUT_FIFO_WORD_SIZE;
 
 
-
   ptp_get_time_info_mod64(ptp_svr, timeInfo);
- 
+
   ptp_outgoing_actual = local_timestamp_to_ptp_mod32(outgoing_timestamp_local,
                                                      timeInfo);
                                                             
@@ -253,22 +243,101 @@ static void manage_buffer(buf_info_t &b,
 
 #endif // (AVB_NUM_MEDIA_OUTPUTS != 0)
 
+#define PLL_TO_WORD_MULTIPLIER 100
+#define INITIAL_MEDIA_CLOCK_OUTPUT_DELAY 100000
+#define EVENT_AFTER_PORT_OUTPUT_DELAY 100
+
+#define INTERNAL_CLOCK_DIVIDE 25
+
+static void update_media_clock_divide(media_clock_t &clk)
+{
+  clk.divWordLength = clk.wordLength * INTERNAL_CLOCK_DIVIDE;
+  clk.baseLength = clk.divWordLength >> (WC_FRACTIONAL_BITS+1);
+}
+
+static void init_media_clock(media_clock_t &clk,
+                             timer tmr,
+                             out port p) {
+  int ptime, time;
+  clk.active = 0;
+  clk.count = 0;
+  clk.wordLength = 0x8235556;
+  update_media_clock_divide(clk);
+  clk.lowBits = 0;
+  clk.prevLowBits = 0;
+  clk.bit = 0;
+  p <: 0 @ ptime;
+  tmr :> time;
+  clk.wordTime = ptime + INITIAL_MEDIA_CLOCK_OUTPUT_DELAY;
+  clk.next_event =
+    time +
+    INITIAL_MEDIA_CLOCK_OUTPUT_DELAY +
+    EVENT_AFTER_PORT_OUTPUT_DELAY;
+}
+
+
+static void do_media_clock_output(media_clock_t &clk,
+                                  out port p)
+{
+  const unsigned int bitMask = (1 << WC_FRACTIONAL_BITS) - 1;
+  const unsigned mult = PLL_TO_WORD_MULTIPLIER/(2*INTERNAL_CLOCK_DIVIDE);
+
+  clk.count++;
+  if (clk.count==mult) {
+    clk.bit = ~clk.bit;
+    clk.count = 0;
+  }
+
+  clk.wordTime += clk.baseLength;
+  clk.next_event += clk.baseLength;
+
+  if (clk.bit) {
+    clk.lowBits = (clk.lowBits + clk.divWordLength) & bitMask;
+    if (clk.lowBits <  clk.prevLowBits) {
+      clk.wordTime += 1;
+      clk.next_event += 1;
+    }
+    clk.prevLowBits = clk.lowBits;
+  }
+
+  p @ clk.wordTime <: clk.bit;
+
+}
+
+static void update_media_clocks(chanend ptp_svr, int clk_time)
+{
+  for (int i=0;i<AVB_NUM_MEDIA_CLOCKS;i++) {
+    if (media_clocks[i].active) {
+      media_clocks[i].wordLength =
+        update_media_clock(ptp_svr,
+                           i,
+                           media_clocks[i],
+                           clk_time,
+                           CLOCK_RECOVERY_PERIOD);
+
+      update_media_clock_divide(media_clocks[i]);
+    }
+  }
+}
+
+
+int mcount=0;
 
 
 void media_clock_server(chanend media_clock_ctl,
-                        chanend ptp_svr, 
+                        chanend ?ptp_svr,
                         chanend ?buf_ctl[],
                         int num_buf_ctl,
-                        chanend ?clk_ctl[], 
-                        int num_clk_ctl)
+                        out port p_fs[])
 {
-  timer tmr;
   unsigned int clk_time;
   int num_clks = AVB_NUM_MEDIA_CLOCKS;
   int registered[MAX_CLK_CTL_CLIENTS];
 #if (AVB_NUM_MEDIA_OUTPUTS != 0)
   unsigned char buf_ctl_cmd;
 #endif
+  timer clk_timers[AVB_NUM_MEDIA_CLOCKS];
+
 
 #if (AVB_NUM_MEDIA_OUTPUTS != 0)
   init_buffers();
@@ -281,32 +350,32 @@ void media_clock_server(chanend media_clock_ctl,
   for (int i=0;i<MAX_CLK_CTL_CLIENTS;i++) 
     registered[i] = -1;
 
-  for (int i=0;i<MAX_NUM_MEDIA_CLOCKS;i++)
-    media_clocks[i].active = 0;
+  clk_timers[0] :> clk_time;
 
-  tmr :> clk_time;
+  clk_time += CLOCK_RECOVERY_PERIOD;
 
-  clk_time += CLOCK_RECOVERY_PERIOD;  
+  for (int i=0;i<AVB_NUM_MEDIA_CLOCKS;i++)
+    init_media_clock(media_clocks[i], clk_timers[0], p_fs[i]);
+
   while (1) {
+    #pragma ordered
     select 
       {
-      case tmr when timerafter(clk_time) :> int _:
-        for (int i=0;i<num_clks;i++) {
-
-          if (media_clocks[i].active) {
-            media_clocks[i].wordLength = 
-              update_media_clock(ptp_svr, 
-                                 i,
-                                 media_clocks[i],
-                                 clk_time,
-                                 CLOCK_RECOVERY_PERIOD);            
-            for (int j=0;j<num_clk_ctl;j++) {
-              if (registered[j]==i)
-                clk_ctl_set_rate(clk_ctl[j], media_clocks[i].wordLength);   
-            }
-          }
+      case (int i=0;i<num_clks;i++)
+        clk_timers[i] when timerafter(media_clocks[i].next_event) :> int now:
+        if ((now - (signed) media_clocks[i].next_event) > media_clocks[i].baseLength) {
+          printintln(now - (signed) media_clocks[i].next_event);
+          printstrln("-------");
+          asm("ecallf %0"::"r"(0));
         }
-        clk_time += CLOCK_RECOVERY_PERIOD;        
+        mcount++;
+        do_media_clock_output(media_clocks[i], p_fs[i]);
+
+        if (timeafter(clk_time, now))
+          {
+            update_media_clocks(ptp_svr, clk_time);
+            clk_time += CLOCK_RECOVERY_PERIOD;
+          }
         break;
 
 #if (AVB_NUM_MEDIA_OUTPUTS != 0)
@@ -326,7 +395,7 @@ void media_clock_server(chanend media_clock_ctl,
             {
             case BUF_CTL_GOT_INFO:
               manage_buffer(buf_info[buf_index], ptp_svr, buf_ctl[i],
-                            buf_index);
+                            buf_index, clk_timers[0]);
               break;
             case BUF_CTL_NEW_STREAM:
               buf_ctl[i] <: buf_info[buf_index].fifo;
@@ -339,7 +408,8 @@ void media_clock_server(chanend media_clock_ctl,
             default:
               break;
             }
-          break;          
+
+          break;
         }
 #endif
       case media_clock_ctl :> int cmd:         
@@ -445,6 +515,7 @@ void media_clock_server(chanend media_clock_ctl,
             break;            
           }
         break;
+
       }
   }
 }
